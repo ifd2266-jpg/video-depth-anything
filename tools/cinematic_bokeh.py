@@ -112,7 +112,7 @@ def clean_silhouette(mask, open_px=6):
     return np.minimum(mask, limit).astype(np.float32)
 
 
-def refine_matte(mask, img, out_px=6, in_px=3, sigma=8.0, open_px=10):
+def refine_matte(mask, img, out_px=6, in_px=3, sigma=8.0, open_px=10, grow_gate=None):
     """Snap a segmentation mask to the real object edge with a local colour model.
 
     Near the boundary every pixel is explained as a mix of the local foreground
@@ -134,6 +134,9 @@ def refine_matte(mask, img, out_px=6, in_px=3, sigma=8.0, open_px=10):
     # trust the colour model only where F and B are clearly different and known
     conf = np.clip((np.sqrt(den) - 0.06) / 0.10, 0, 1) * (wf > 0.02) * (wb > 0.02)
     alpha = np.where(band, conf * a + (1 - conf) * mask, mask).astype(np.float32)
+    if grow_gate is not None:
+        # outside the segmenter's mask, only pixels passing the gate may be added
+        alpha = np.where(hard == 0, alpha * grow_gate, alpha).astype(np.float32)
     # growth outside the segmenter's mask may only form a smooth extension of
     # the silhouette: thin protrusions (background lines that happen to match
     # the subject colour) are removed by an opening of the whole silhouette
@@ -182,6 +185,18 @@ def main():
         ids = list(fz['ids'])
         po = fz['per_object']
         obj_by_id = {int(oid): i for i, oid in enumerate(ids)}
+        # in-focus objects: fill one-frame dropouts (segmenter resets on prompt
+        # frames can lose e.g. a fingertip for a single frame). A pixel present
+        # in both neighbouring frames is kept in the current one.
+        po = po.astype(np.float32)
+        for oid in args.focus_ids:
+            if oid in obj_by_id:
+                k = obj_by_id[oid]
+                m = po[k].copy()
+                nb = np.minimum(np.concatenate([m[:1], m[:-1]]), np.concatenate([m[1:], m[-1:]]))
+                nb[0], nb[-1] = np.minimum(m[1], m[2]), np.minimum(m[-2], m[-3])  # ends: two nearest frames
+                po[k] = np.maximum(m, nb)
+        focus_masks = np.max([po[obj_by_id[o]] for o in args.focus_ids if o in obj_by_id], axis=0)
         arm_idx = [i for i, oid in enumerate(ids) if int(oid) not in args.focus_ids]
         if arm_idx:
             arm = po[arm_idx].astype(np.float32).max(0)
@@ -239,7 +254,17 @@ def main():
                     if oid not in obj_by_id:
                         continue
                     m = up(po[obj_by_id[oid], t].astype(np.float32))
-                    parts.append(refine_matte(m, img) if oid in args.refine_ids else clean_silhouette(m))
+                    if oid in args.refine_ids:
+                        parts.append(refine_matte(m, img))
+                    else:
+                        # skin: colour matting may recover missed edge (fingertip
+                        # against dark interior) but only strongly skin-coloured
+                        # pixels may be added (no beige trim); against similar
+                        # colours (orange screen) the matting has no confidence
+                        cr = cv2.cvtColor(img8, cv2.COLOR_BGR2YCrCb)[..., 1].astype(np.float32)
+                        gate = np.clip((cr - 148.0) / 6.0, 0, 1)
+                        # additive only: SAM's skin edges are not shaved
+                        parts.append(clean_silhouette(np.maximum(m, refine_matte(m, img, out_px=10, open_px=3, grow_gate=gate)), open_px=3))
                 foc = np.max(parts, 0)
                 # fill thin gaps where separately segmented objects touch
                 # (fingertip against the device edge) without growing outward
