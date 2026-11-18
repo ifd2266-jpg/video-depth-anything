@@ -103,6 +103,38 @@ def scatter(out, lin_b, rad, lv, kcache, far_to_near):
     return out
 
 
+def refine_matte(mask, img, out_px=14, in_px=3, sigma=8.0):
+    """Snap a segmentation mask to the real object edge with a local colour model.
+
+    Near the boundary every pixel is explained as a mix of the local foreground
+    colour F (from inside the mask) and local background colour B (from outside):
+    alpha = <I-B, F-B> / |F-B|^2. Recovers thin edge strips the segmenter missed
+    (e.g. a bright bezel or a fingertip) and removes background it wrongly took.
+    """
+    hard = (mask > 0.5).astype(np.uint8)
+    inner = cv2.erode(hard, np.ones((2 * in_px + 1,) * 2, np.uint8)).astype(np.float32)
+    outer = (1 - cv2.dilate(hard, np.ones((2 * out_px + 1,) * 2, np.uint8))).astype(np.float32)
+    band = (inner == 0) & (outer == 0)
+    F, wf = norm_conv(img, inner[..., None].repeat(3, 2), sigma * 2)
+    B, wb = norm_conv(img, outer[..., None].repeat(3, 2), sigma * 2)
+    wf, wb = wf[..., 0], wb[..., 0]
+    FB = F - B
+    den = (FB * FB).sum(2)
+    a = ((img - B) * FB).sum(2) / np.maximum(den, 1e-6)
+    a = np.clip(a, 0, 1)
+    # trust the colour model only where F and B are clearly different and known
+    conf = np.clip((np.sqrt(den) - 0.06) / 0.10, 0, 1) * (wf > 0.02) * (wb > 0.02)
+    alpha = np.where(band, conf * a + (1 - conf) * mask, mask).astype(np.float32)
+    # keep only what is connected to the object (no stray specks)
+    n, lab = cv2.connectedComponents((alpha > 0.5).astype(np.uint8))
+    if n > 2:
+        keep = np.zeros(n, bool)
+        ids = np.unique(lab[inner > 0])
+        keep[ids[ids > 0]] = True
+        alpha = alpha * keep[lab]
+    return np.clip(cv2.GaussianBlur(alpha, (0, 0), 0.7), 0, 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--frames', required=True)
@@ -112,6 +144,7 @@ def main():
     ap.add_argument('--rmax', type=float, default=58.0, help='blur radius (px) at infinity')
     ap.add_argument('--fg_max', type=float, default=70.0)
     ap.add_argument('--grain', type=float, default=1.0)
+    ap.add_argument('--refine', type=int, default=1, help='snap masks to edges with local colour matting')
     ap.add_argument('--ramp', type=float, default=140.0, help='px over which the arm goes out of focus')
     ap.add_argument('--only', type=int, nargs='*', default=None)
     args = ap.parse_args()
@@ -160,11 +193,16 @@ def main():
         # never large bright areas like the sky -> no blown-out background
         local = cv2.GaussianBlur(lum, (0, 0), 25)
         spec = np.clip((lum - local - 0.12) / 0.3, 0, 1) * np.clip((lum - 0.45) / 0.3, 0, 1)
-        boost = 1.0 + 3.0 * spec ** 1.5
-        lin_b = lin * boost[..., None]
-
         subj = up(subj_masks[t])
         foc = up(focus_masks[t])
+        if args.refine:
+            foc = refine_matte(foc, img)
+            subj = np.maximum(subj, foc)
+        # bright pixels hugging the subject are its own edge, never bokeh points
+        near = cv2.dilate((foc > 0.3).astype(np.uint8), np.ones((61, 61), np.uint8)).astype(np.float32)
+        spec = spec * (1 - cv2.GaussianBlur(near, (0, 0), 8))
+        boost = 1.0 + 3.0 * spec ** 1.5
+        lin_b = lin * boost[..., None]
         d = (up(depths[t]) - lo) / (hi - lo)
         d = snap_depth(d, subj)
         df = dfs[t]
