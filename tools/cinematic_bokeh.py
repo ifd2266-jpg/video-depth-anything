@@ -103,7 +103,16 @@ def scatter(out, lin_b, rad, lv, kcache, far_to_near):
     return out
 
 
-def refine_matte(mask, img, out_px=14, in_px=3, sigma=8.0):
+def clean_silhouette(mask, open_px=6):
+    """Remove thin spikes from a soft mask, keeping its anti-aliased edge."""
+    hard = (mask > 0.5).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * open_px + 1,) * 2)
+    smooth = cv2.morphologyEx(hard, cv2.MORPH_OPEN, k)
+    limit = np.clip(cv2.GaussianBlur(smooth.astype(np.float32), (0, 0), 1.0) * 1.6, 0, 1)
+    return np.minimum(mask, limit).astype(np.float32)
+
+
+def refine_matte(mask, img, out_px=6, in_px=3, sigma=8.0, open_px=10):
     """Snap a segmentation mask to the real object edge with a local colour model.
 
     Near the boundary every pixel is explained as a mix of the local foreground
@@ -125,6 +134,16 @@ def refine_matte(mask, img, out_px=14, in_px=3, sigma=8.0):
     # trust the colour model only where F and B are clearly different and known
     conf = np.clip((np.sqrt(den) - 0.06) / 0.10, 0, 1) * (wf > 0.02) * (wb > 0.02)
     alpha = np.where(band, conf * a + (1 - conf) * mask, mask).astype(np.float32)
+    # growth outside the segmenter's mask may only form a smooth extension of
+    # the silhouette: thin protrusions (background lines that happen to match
+    # the subject colour) are removed by an opening of the whole silhouette
+    grown = (alpha > 0.5).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * open_px + 1,) * 2)
+    smooth = cv2.morphologyEx(grown, cv2.MORPH_OPEN, k)
+    # applied to the whole silhouette (the segmenter's own mask can carry
+    # such spikes too); keep a 2px margin so the soft anti-aliased edge stays
+    limit = np.clip(cv2.GaussianBlur(smooth.astype(np.float32), (0, 0), 0.8) * 1.3, 0, 1)
+    alpha = np.minimum(alpha, limit).astype(np.float32)
     # keep only what is connected to the object (no stray specks)
     n, lab = cv2.connectedComponents((alpha > 0.5).astype(np.uint8))
     if n > 2:
@@ -144,6 +163,8 @@ def main():
     ap.add_argument('--rmax', type=float, default=58.0, help='blur radius (px) at infinity')
     ap.add_argument('--fg_max', type=float, default=70.0)
     ap.add_argument('--grain', type=float, default=1.0)
+    ap.add_argument('--focus_ids', type=int, nargs='*', default=[1, 2], help='object ids that are in focus')
+    ap.add_argument('--refine_ids', type=int, nargs='*', default=[1], help='objects refined with colour matting (others only de-spiked)')
     ap.add_argument('--refine', type=int, default=1, help='snap masks to edges with local colour matting')
     ap.add_argument('--ramp', type=float, default=140.0, help='px over which the arm goes out of focus')
     ap.add_argument('--only', type=int, nargs='*', default=None)
@@ -154,6 +175,19 @@ def main():
     fz = np.load(args.focus)
     focus_masks = fz['focus'].astype(np.float32)
     subj_masks = fz['subject'].astype(np.float32) if 'subject' in fz else focus_masks
+    po, obj_by_id = None, {}
+    if 'per_object' in fz and 'ids' in fz:
+        # arm / sleeve objects: temporal median over 5 frames so a one-frame
+        # segmentation dropout (e.g. on a prompt frame) can't make blur pop
+        ids = list(fz['ids'])
+        po = fz['per_object']
+        obj_by_id = {int(oid): i for i, oid in enumerate(ids)}
+        arm_idx = [i for i, oid in enumerate(ids) if int(oid) not in args.focus_ids]
+        if arm_idx:
+            arm = po[arm_idx].astype(np.float32).max(0)
+            Tm = arm.shape[0]
+            arm_med = np.stack([np.median(arm[max(0, t - 2):min(Tm, t + 3)], axis=0) for t in range(Tm)])
+            subj_masks = np.maximum(focus_masks, arm_med)
     T = len(files)
     H, W = cv2.imread(files[0]).shape[:2]
     os.makedirs(args.out, exist_ok=True)
@@ -196,7 +230,26 @@ def main():
         subj = up(subj_masks[t])
         foc = up(focus_masks[t])
         if args.refine:
-            foc = refine_matte(foc, img)
+            if po is not None and args.refine_ids:
+                # colour-matting refinement only for hard-edged objects (the
+                # device); skin edges from the segmenter are already accurate
+                # and skin-like background (tan trim) would be pulled in
+                parts = []
+                for oid in args.focus_ids:
+                    if oid not in obj_by_id:
+                        continue
+                    m = up(po[obj_by_id[oid], t].astype(np.float32))
+                    parts.append(refine_matte(m, img) if oid in args.refine_ids else clean_silhouette(m))
+                foc = np.max(parts, 0)
+                # fill thin gaps where separately segmented objects touch
+                # (fingertip against the device edge) without growing outward
+                hard = (foc > 0.5).astype(np.uint8)
+                kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+                gap = (cv2.morphologyEx(hard, cv2.MORPH_CLOSE, kc) > 0) & (hard == 0)
+                foc = np.where(gap, 1.0, foc).astype(np.float32)
+                foc = np.maximum(foc, cv2.GaussianBlur(gap.astype(np.float32), (0, 0), 0.7))
+            else:
+                foc = refine_matte(foc, img)
             subj = np.maximum(subj, foc)
         # bright pixels hugging the subject are its own edge, never bokeh points
         near = cv2.dilate((foc > 0.3).astype(np.uint8), np.ones((61, 61), np.uint8)).astype(np.float32)
